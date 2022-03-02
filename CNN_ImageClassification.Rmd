@@ -1,0 +1,493 @@
+---
+title: "CAP5638 Final Project: Remote sensing image classification with Convolution Neural Network"
+author: "Feilin Lai"
+date: "December 13, 2017"
+output: html_document
+---
+
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 15px;
+      font-family: "Times New Roman", Times, serif;
+  }
+h1.title {
+  font-size: 18px;
+  font-family: "Times New Roman", Times, serif;
+  color: Black;
+  font-weight: normal;
+  font-style:italic;
+  text-align: left;
+}
+h1 { /* Header 2 */
+  font-size: 24px;
+  font-weight: bold;
+  text-align: center;
+}
+h2 { /* Header 2 */
+  font-size: 18px;
+  color: Blue;
+}
+h3 { /* Header 3 */
+  font-size: 17px;
+}
+
+</style>
+
+
+# I. Introduction
+Remote sensing images contain abundant information about the earth surface, and it is a common practice to apply digital classification techniques to satellite images to explore the area covered by the images. Remote sensors capture the reflectance of ground at multiple spectral bands, each image band consists of a matrix of pixels that representing the spatial unit on the ground. Traditional remote sensing classification algorithms are mostly based on pixel, which is limited by inter-class spectral confusion, therefore spectral information alone cannot satisfy the desire of high classification accuracy. This issue might be addressed by the Convolution Neural Network (CNN) that takes a neighborhood of each pixel as input samples. According to Tobler's First Law of geography that near things are more similar than distant things, using the neighborhood as classification samples can generate more consistent results by using both spatial relationship within pixels and spectral information in the classification process.To explore the effectiveness of CNN in Land Cover classification, an experiment is conducted over a heterogenous urban area. 
+
+```{r,echo=FALSE}
+# set work directory
+setwd("D:/OneDrive - Florida State University/Courses/CAP_5638 Pattern Recognition/Final")
+suppressMessages(library(raster))
+# Read the 7-layer OLI image for Rio de Janeiro
+RJ.oli <- stack("RJ_OLI_7B")
+# Read shapefile
+suppressMessages(library(rgdal)) 
+# Import the boundary of the study area
+RJ.shp <- readOGR(dsn = "RJ_boundary.shp",layer = "RJ_boundary")
+# test.image<-stack("multi.dat")
+```
+
+# II. Study Area
+The study area for this study locates at the city of Rio de Janeiro, Brazil. It is featured by complex urban features. Differentiating informal built-up lands from formal built-up lands based on remote sensing images is challenging due to their similarity in spectral response. 
+```{r}
+# Overlay the study area boundary in the interactive GoogleMap GUI
+suppressMessages(library(leaflet))
+suppressMessages(library(ggmap))
+LL = ggmap::geocode("Rio de Janeiro")
+leaflet() %>%
+  addTiles() %>%
+  setView(LL[1, 1], LL[1, 2], zoom = 9) %>%
+  addPolygons(data = RJ.shp)
+```
+
+# III. Data: Landsat 8 OLI Image
+The study area is fully covered by a single shot of Path 217, Row 76 along the Landsat 8 track, and one scene captured on Jan 31, 2016 was downloaded. The data is processed and stored in Level-1T precision by the USGS EROS Data Center.It has been radiometrically calibrated and atmospheric corrected in the former research project. Import the preprocessed image and plot it. 
+```{r}
+# Plot False Color Combinaton (Near Infrared, Red, Green, max pixel value, linear stretch visual effect)
+plotRGB(RJ.oli, r = 5, g = 4, b = 3, scale=65535,stretch="lin")
+```
+
+# IV. Classification scheme
+There are 6 target classification classes, some of them have subclasses. The classification can either be done by training 6 classes, or training 12 subclasses then combining them into 6 target classes in the end. 
+```{r}
+trainp<-read.csv("train_points.csv", header = TRUE,stringsAsFactor=FALSE)
+testp <-read.csv("test_points.csv",  header = TRUE,stringsAsFactor=FALSE)
+# Sub training classes label
+label.subtrain = c(rep(1.1,105),rep(1.2,173),rep(1.3,152),
+                   rep(1.4,17), rep(1.5,252),                 # 1 Formal Built-up Land (5 subclasses)
+                   rep(2,194),                                # 2 Informal Built-up Land
+                   rep(3.1,35), rep(3.2,141),rep(3.3,23),     # 3 Barren Land (3 subclasses)
+                   rep(4,165),                                # 4 Forest Land
+                   rep(5,114),                                # 5 Grassland and crop land
+                   rep(6,113))                                # 6 Waters
+class = c("Formal","Informal","Barren","Forest","Grassland","Waters")
+ntrain= c(699,194,199,165,114,113)
+ntest = c(160,100,50,120,100,50)
+# Training labels
+label.train=c(rep(1:6, ntrain))  
+label.train.text = c(rep(class,ntrain))
+# Test labels
+label.test = rep(1:6,ntest)
+label.test.text = rep(class,ntest)
+# Table of Classes
+data.frame(class=class,train.size=ntrain, test.size=ntest)
+```
+
+# V. Training and testing samples
+The loaded samples are based on pixels, their file coordinates, map coordinates, and geographic coordinates (long/lat) are all included in a cvs file exported from the remote sensing software I used in the former study. Plot the location of samples on the image.
+```{r}
+# create a grayscale color palette to use for the image.
+grayscale_colors <- gray.colors(100,            # number of different color levels 
+                                start = 0.0,    # how black (0) to go
+                                end = 1.0,      # how white (1) to go
+                                gamma = 2.2,    # correction between how a digital 
+                                # camera sees the world and how human eyes see it
+                                alpha = NULL)   #Null=colors are not transparent
+# Plot training samples
+plot(RJ.oli[[1]], col=grayscale_colors, axes=FALSE,main="Training samples", legend=FALSE)
+# plot location of each training sample
+points(trainp$Map.X,trainp$Map.Y, pch=19, cex=.3, col = 2)
+# plot square around the centroid
+points(trainp$Map.X,trainp$Map.Y, pch=0, cex = 2, col = "blue" )
+
+# Plot test samples
+plot(RJ.oli[[1]], col=grayscale_colors, axes=FALSE,main="Testing samples", legend=FALSE)
+points(testp$Map.X,testp$Map.Y, pch=19, cex=.3, col = 2)
+```
+
+# VI. Methodology
+## 1. Resampling the training and testing sample with a window
+Extract 3x3 window based on the samples for the input of CNN, the size of individual input node will be 3x3x7, there are 1484 training inputs and 580 testing inputs.
+```{r}
+crd<-trainp[3:4] # training sample coordinates
+tcrd<-testp[3:4] # testing sample coordinates
+# Ensemble vectors extracted from (3x3x7) to individual insance (label+63 features) 
+arrange<-function(coordinate,win.size){
+  data=c(0)
+  s=win.size*win.size
+  for (i in 1:(nrow(coordinate)/s)){
+    ins=var=i
+    for(j in 1:s){
+      var<-coordinate[(i-1)*s+j,]
+      ins<-c(ins,var)
+    }
+    data<-rbind(data,ins)
+  }
+  return (data[-1,])
+}
+
+# Extract window values from the raster, re-arrange the input features
+win.sampling<-function(image, coordinate, win.size){ 
+  win=w=c(0)
+  r=floor(win.size/2) # radius from the centroid of the sample
+  for (i in 1:nrow(coordinate)){
+    x=coordinate[i,1]
+    y=coordinate[i,2]
+    w<-cbind(seq(x-r*30,x+r*30,30),
+             rep(seq(y-r*30,y+r*30,30),each=win.size)) # set up location of the pixel in a 3x3 grid
+    win<-rbind(win,w)                                  # append to the temporary coordinate list
+  }
+  temp<-extract(image,win[-1,])                        # Get image value using temporary coordinates
+  win.sample<-arrange(temp,win.size)
+  return(win.sample)
+}
+train.win3<-win.sampling(RJ.oli,crd,3)
+test.win3 <-win.sampling(RJ.oli,tcrd,3)
+```
+
+Examine some training samples by class (also by bands)
+```{r}
+train<-as.data.frame(train.win3)
+test <-as.data.frame(test.win3)
+names(train)<-as.vector(0:63)
+names(test) <-as.vector(0:63)
+
+# Plot some of image samples, 3x3 features
+par(mfrow=c(2,3))
+lapply(c(1,700,895,1095,1280,1395), 
+       function(x) {
+         r1 <- r2 <- r3 <- raster(nrow=3, ncol=3)
+         values(r1)<-as.integer(train[x,11:19])
+         values(r2)<-as.integer(train[x,20:28])
+         values(r3)<-as.integer(train[x,29:37])
+         image(r3,col=gray.colors(255),axes=FALSE, xlab="R-band", ylab="",main=label.train.text[x])
+         image(r2,col=gray.colors(255),axes=FALSE, xlab="G-band", ylab="",main=label.train.text[x])
+         image(r1,col=gray.colors(255),axes=FALSE, xlab="B-band", ylab="",main=label.train.text[x])
+         }
+)
+```
+
+## 2. CNN with h2o package
+h2o is an open source math engine for big data that computes parallel distributed machine learning algorithms such as generalized linear models, gradient boosting machines, random forests, and neural networks (deep learning) within various cluster environments.
+
+### 2.1 Initial h2o process, Use h2o package, and load the training and testing datasets and convert the label to digit factor
+```{r}
+suppressMessages(library(h2o))
+#start a local h2o cluster
+local.h2o <- h2o.init(ip = "localhost", port = 54321, startH2O = TRUE, nthreads=-1)
+```
+
+### 2.2 Train the model by 6 classes using 3x3 window size 
+```{r}
+# convert digit labels to factor for classification
+train[,1]<-label.train.text
+train[,1]<-as.factor(train[,1])
+ 
+# pass dataframe from inside of the R environment to the H2O instance
+trData<-as.h2o(train)
+
+# Next is to train the model. For this experiment, default setting of 200 layers of 200 nodes each are used. The activation function used is Tanh, cross-entropy was used as the loss function and number of epochs is 20
+LC.dl <- h2o.deeplearning(x = 2:64,             # window of inputs 63(3x3x7)
+                          y = 1,                # training labels
+                          trData,               # h2o data
+                          activation = "Tanh",  # activation function
+                          loss="CrossEntropy",  # Loss function
+                          epochs = 50)          # epochs
+
+# Model accuracy
+h2o.confusionMatrix(LC.dl)
+
+# Predict the test data
+test_h2o<-as.h2o(test[-1])
+pred.dl.test<-h2o.predict(object=LC.dl, newdata=test_h2o)
+# convert H2O format into data frame and save as csv
+df.test <- as.data.frame(pred.dl.test)
+
+# Confusion Matrix
+suppressMessages(library(caret))
+confusionMatrix(df.test$predict,label.test.text)
+```
+
+### Display Classification results (3x3 window based on 6 classes)
+```{r}
+r3<-as.array(RJ.oli)
+# resample all the pixels in the image
+
+```
+
+### 2.3 Train the model with 12 subclasses, then merge the results
+```{r}
+# convert digit labels to factor for classification
+train[,1]<-label.subtrain
+train[,1]<-as.factor(train[,1])
+ 
+# pass dataframe from inside of the R environment to the H2O instance
+trData<-as.h2o(train)
+
+# Next is to train the model. For this experiment, default setting of 200 layers of 200 nodes each are used. The activation function used is Tanh and number of epochs is 50
+LC.sub.dl <- h2o.deeplearning(x = 2:64, y = 1, trData, activation = "Tanh",
+                              loss="CrossEntropy",epochs = 50)
+
+# Model accuracy
+h2o.confusionMatrix(LC.sub.dl)
+
+#Predict the test data
+test_h2o<-as.h2o(test[-1])
+pred.dl.test<-h2o.predict(object=LC.sub.dl, newdata=test_h2o)
+
+# convert H2O format into data frame and save as csv
+df.test <- as.data.frame(pred.dl.test)
+
+# Confusion Matrix
+prediction<-floor(as.numeric(levels(df.test$predict))[df.test$predict])
+confusionMatrix(prediction,label.test)
+```
+
+
+### 2.4 Use 5 as window size to generate input patterns for the CNN
+```{r}
+train.win5<-win.sampling(RJ.oli,crd,5)
+test.win5 <-win.sampling(RJ.oli,tcrd,5)
+train<-as.data.frame(train.win5)
+test <-as.data.frame(test.win5)
+names(train)<-as.vector(0:175)
+names(test) <-as.vector(0:175)
+
+# Plot some of image samples, only three bands are included
+par(mfrow=c(2,3))
+lapply(c(1,700,895,1095,1280,1395), 
+       function(x) {
+         r1 <- r2 <- r3 <- raster(nrow=5, ncol=5)
+         values(r1)<-as.integer(train[x,27:51])
+         values(r2)<-as.integer(train[x,52:76])
+         values(r3)<-as.integer(train[x,77:101])
+         image(r3,col=gray.colors(255),axes=FALSE, xlab="R-band", ylab="",main=label.train.text[x])
+         image(r2,col=gray.colors(255),axes=FALSE, xlab="G-band", ylab="",main=label.train.text[x])
+         image(r1,col=gray.colors(255),axes=FALSE, xlab="B-band", ylab="",main=label.train.text[x])
+       }
+      )
+```
+   
+Classification process and Accuracy Assessment      
+```{r}
+# convert digit labels to factor for classification
+train[,1]<-label.train.text
+train[,1]<-as.factor(train[,1])
+ 
+# pass dataframe from inside of the R environment to the H2O instance
+trData<-as.h2o(train)
+
+# Next is to train the model. For this experiment, default setting of 200 layers of 200 nodes each are used. The activation function used is Tanh and number of epochs is 50
+win5.dl <- h2o.deeplearning(x = 2:176, y = 1, trData, activation = "Tanh", 
+                              loss="CrossEntropy",epochs = 50)
+# Model accuracy
+h2o.confusionMatrix(LC.dl)
+
+# Predict the test data
+test_h2o<-as.h2o(test[-1])
+pred.dl.test<-h2o.predict(object=win5.dl, newdata=test_h2o)
+# convert H2O format into data frame and save as csv
+df.test <- as.data.frame(pred.dl.test)
+
+# Confusion Matrix
+suppressMessages(library(caret))
+confusionMatrix(df.test$predict,label.test.text)
+
+# shut down virtual H2O cluster
+h2o.shutdown(prompt = FALSE)
+```
+
+# VII. Conclusion
+Based on the experiment, several conclusions can be made:
+1. Classification based on subclasses is not as good as the one based on final target classes, some of the subclasses are highly confused with others. 
+2. The preference for window size selection between 3x3 and 5x5 is not significant. 
+3. The major confusions are between informal built-up land v.s. formal built-up land, and formal built-up land v.s. barren land
+4. In terms of conditional accuracy for each class, the accuracy for informal built-up land has been improved by CNN. However, barren land and exposed land, another highly confused class, is still hard to be differentiated with some non-barren areas.
+5. In terms of overall accuracy, the algorithm settled in the experiment does not significant improve the classification accuracy comparing to general "non-deep" machine learning methods. More experiments are to be done to explore the optimal parameters and structure of CNN. 
+
+```{r,,eval=FALSE, echo=FALSE}
+
+## Print the classification result from 3x3 convolution window
+crd<-coordinates(test.image)
+train.win3<-win.sampling(RJ.oli,crd,3)
+
+# Other related experiment CNN Experiment on the MNIST dataset in programming project 1
+### Import dataset 
+input.data<-function(filename){
+  data<-read.table(file=filename, header = FALSE)
+  for(i in ncol(data):2)  names(data)[i]<-names(data)[i-1] # adjust the column names
+  names(data)[1]<-"label"
+  return(data)
+}
+train<-input.data("zip_train_small.txt")
+test<-input.data("zip_test_small.txt")
+dim(train)
+
+
+## 1. Examine the data
+
+# reverses (rotates the matrix)
+rotate <- function(x) t(apply(x, 2, rev)) 
+ 
+# Plot some of image samples, 20 samples for each class, 16*16 features
+par(mfrow=c(2,3))
+lapply(c(1,21,41,61,81,101), 
+       function(x) image(
+         rotate(matrix(unlist(train[x,-1]),nrow = 16, byrow = TRUE)),
+         col=grey.colors(255),
+         xlab=train[x,1]
+       )
+)
+
+
+## 2. Separate the dataset to 80% for training and 20% for testing
+
+suppressMessages(library(caret))
+inTrain<- createDataPartition(train$label, p=0.8, list=FALSE)
+training<-train[inTrain,]
+testing<-train[-inTrain,]
+ 
+#store the datasets into .csv files
+write.csv (training , file = "train-data.csv", row.names = FALSE) 
+write.csv (testing , file = "test-data.csv", row.names = FALSE)
+
+
+## 3. Train the model
+
+# convert digit labels to factor for classification
+training[,1]<-as.factor(training[,1])
+ 
+# pass dataframe from inside of the R environment to the H2O instance
+trData<-as.h2o(training)
+tsData<-as.h2o(testing)
+
+# Next is to train the model. For this experiment, default setting of 200 layers of 200 nodes each are used. The activation function used is Tanh and number of epochs is 20
+res.dl <- h2o.deeplearning(x = 2:275, y = 1, trData, activation = "Tanh",epochs = 20)
+
+
+## 4. Predict the 20% test subset
+
+#use model to predict testing dataset
+pred.dl<-h2o.predict(object=res.dl, newdata=tsData[,-1])
+pred.dl.df<-as.data.frame(pred.dl)
+ 
+summary(pred.dl)
+test_labels<-testing[,1]
+ 
+#calculate number of correct prediction
+sum(diag(table(test_labels,pred.dl.df[,1])))/nrow(testing)
+
+
+## 5. Predict the test data
+
+test_h2o<-as.h2o(test)
+
+pred.dl.test<-h2o.predict(object=res.dl, newdata=test_h2o[,-1])
+
+# convert H2O format into data frame and save as csv
+df.test <- as.data.frame(pred.dl.test)
+
+# Caculating accuracy
+label=test[1]
+length(which(label==as.vector(df.test$predict)))/nrow(test)
+
+# shut down virtual H2O cluster
+h2o.shutdown(prompt = FALSE)
+```
+
+
+```{r,eval=FALSE, echo=FALSE}
+# Deserted Code
+# Read the tiff image containing 7 bands
+L1 <- raster("RJ.oli.dat")
+L2 <- raster("RJ.oli.dat",band = 2)
+L3 <- raster("RJ.oli.dat",band = 3)
+L4 <- raster("RJ.oli.dat",band = 4)
+L5 <- raster("RJ.oli.dat",band = 5)
+L6 <- raster("RJ.oli.dat",band = 6)
+L7 <- raster("RJ.oli.dat",band = 7)
+
+# create a grayscale color palette to use for the image.
+grayscale_colors <- gray.colors(100,            # number of different color levels 
+                                start = 0.0,    # how black (0) to go
+                                end = 1.0,      # how white (1) to go
+                                gamma = 2.2,    # correction between how a digital 
+                                # camera sees the world and how human eyes see it
+                                alpha = NULL)   #Null=colors are not transparent
+# Examine Band 1
+plot(L1, col=grayscale_colors, axes=FALSE,main="Band 1-Rio de Janeiro") 
+# Overview of the data
+par(mfrow=c(2,3))
+plot(L2, col=grayscale_colors, axes=FALSE,main="Band 2") 
+plot(L3, col=grayscale_colors, axes=FALSE,main="Band 3") 
+plot(L4, col=grayscale_colors, axes=FALSE,main="Band 4") 
+plot(L5, col=grayscale_colors, axes=FALSE,main="Band 5") 
+plot(L6, col=grayscale_colors, axes=FALSE,main="Band 6")
+plot(L7, col=grayscale_colors, axes=FALSE,main="Band 7")
+
+
+# Extract 2x2 window based on the samples for the input of CNN, the size of individual input node will be 2x2x7, there are 1484 inputs
+
+suppressMessages(library(sp))
+proj<- RJ.oli@crs # coordinate system info
+map.xy = SpatialPointsDataFrame(trainp[3:4], trainp, proj4string = proj)
+map.xy
+# Extract training set
+trainingp<-extract(RJ.oli,map.xy)
+train3<-extract(RJ.oli,map.xy, buffer=42.6) #
+write.csv(train33, "trainbuf2.csv") # the convenient one
+
+# Extract raster value use polygon
+
+# Create a sqaure buffer 
+# set the radius for the plots
+radius <- 30 # 30 meter resolution
+
+# define the plot edges based upon the plot radius. 
+yPlus <- trainp$Map.Y+radius
+xPlus <- trainp$Map.X+radius
+yMinus<- trainp$Map.Y-radius
+xMinus<- trainp$Map.X-radius
+
+# calculate polygon coordinates for each plot centroid. 
+square=cbind(xMinus,yPlus,  # NW corner
+	xPlus, yPlus,  # NE corner
+	xPlus,yMinus,  # SE corner
+	xMinus,yMinus, # SW corner
+	xMinus,yPlus)  # NW corner again - close ploygon
+
+ID=c(1:1484)
+# create spatial polygons from coordinates
+polys <- SpatialPolygons(mapply(function(poly, id){
+	    xy <- matrix(poly, ncol=2, byrow=TRUE)
+	    Polygons(list(Polygon(xy)), ID=id)
+	  }, 
+    split(square, row(square)), ID),
+    proj4string=CRS(as.character(proj)))
+
+# Plot
+plot(polys)
+plot(L1, col=grayscale_colors, axes=FALSE,main="Training samples", legend=FALSE)
+plot(polys, col="red", add=TRUE)
+
+# Extract values 
+training<-extract(RJ.oli,polys,df=TRUE)
+write.csv(training, "train2x2.csv")
+```
+
+
+
